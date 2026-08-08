@@ -29,7 +29,12 @@ from telegram.ext import (
 )
 
 # ============ TƏNZİMLƏMƏLƏR ============
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8873950422:AAF4y-_ztn-mX_yQlpsxQc7jrb6Cf9Qai2I")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+if not BOT_TOKEN:
+    raise SystemExit(
+        "XƏTA: BOT_TOKEN environment variable təyin olunmayıb. "
+        "Railway/Termux-da BOT_TOKEN dəyişənini @BotFather-dan aldığınız token ilə əlavə edin."
+    )
 STARS_PRICE = 25                  # Telegram Stars miqdarı
 CLONE_BASE_DIR = "clones"         # köhnə/müvəqqəti fayllar üçün (zip mərhələsi)
 CACHE_BASE_DIR = "site_cache"      # saytların qalıcı keşi (domen başına bir qovluq)
@@ -75,6 +80,9 @@ def cache_dir_for(domain: str) -> str:
 
 # Ödəniş/hak seçimi gözləyən klonlar üçün müvəqqəti yaddaş (yaddaşda saxlanılır, restart-da sıfırlanır)
 PENDING_JOBS: dict[str, dict] = {}
+
+# Hər istifadəçinin hazırda işləyən klonlama task-ı (/cancel üçün)
+ACTIVE_CLONE_TASKS: dict[int, "asyncio.Task"] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +297,7 @@ async def run_clone(clone_dir: str, url: str) -> tuple[bool, str]:
 
     async def run_one(urls: list[str]) -> str:
         cmd = ["wget", *base_flags, "-P", clone_dir, *urls]
+        process = None
         try:
             process = await asyncio.create_subprocess_exec(
                 *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
@@ -297,6 +306,10 @@ async def run_clone(clone_dir: str, url: str) -> tuple[bool, str]:
             if process.returncode in (0, 8):
                 return ""
             return stderr.decode(errors="ignore")[-200:]
+        except asyncio.CancelledError:
+            if process:
+                process.kill()
+            raise
         except FileNotFoundError:
             return "Serverdə `wget` quraşdırılmayıb."
         except Exception as e:
@@ -414,6 +427,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(WELCOME_TEXT, parse_mode="Markdown", reply_markup=main_menu_keyboard(user.id))
 
 
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    task = ACTIVE_CLONE_TASKS.get(user_id)
+    if task and not task.done():
+        task.cancel()
+        await update.message.reply_text("🛑 Klonlama dayandırılır...")
+    else:
+        await update.message.reply_text("ℹ️ Hazırda aktiv klonlama tapılmadı.")
+
+
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
@@ -528,11 +551,34 @@ async def handle_domain(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         animation_task = asyncio.create_task(animate())
 
+        current_task = asyncio.current_task()
+        ACTIVE_CLONE_TASKS[user_id] = current_task
+        cancelled = False
+
         try:
             success, error_text = await run_clone(clone_dir, url)
+        except asyncio.CancelledError:
+            cancelled = True
+            success, error_text = False, ""
         finally:
             stop_animation.set()
             await animation_task
+            if ACTIVE_CLONE_TASKS.get(user_id) is current_task:
+                ACTIVE_CLONE_TASKS.pop(user_id, None)
+
+    if cancelled:
+        if not is_repeat:
+            shutil.rmtree(clone_dir, ignore_errors=True)
+        try:
+            await status_msg.edit_text(
+                f"🛑 *{domain}* klonlanması dayandırıldı.\n\n"
+                "Yenidən göndərmək istəyirsinizsə saytın ünvanını göndərin.",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+        await log_event(context, f"🛑 {user_label(user)} — `{domain}` klonlamasını dayandırdı.")
+        return
 
     if not success:
         # Qeyd: keş qovluğu silinmir — əgər əvvəllər uğurlu klon var idisə, o qalır
@@ -592,7 +638,7 @@ async def handle_domain(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 3) Standart axın — ulduz ödənişi
     await status_msg.edit_text(summary + f"\nFaylları yükləmək üçün {STARS_PRICE} ⭐ ödəniş et 👇", parse_mode="Markdown")
 
-    payload = f"{clone_dir}|{slug}"
+    payload = f"{clone_dir}|{slug}|{domain}"
     await context.bot.send_invoice(
         chat_id=update.effective_chat.id,
         title=f"{domain} — Sayt kopyası",
@@ -633,7 +679,7 @@ async def credit_choice_callback(update: Update, context: ContextTypes.DEFAULT_T
         )
         await send_clone_zip(context, job["chat_id"], job["clone_dir"], job["slug"])
     else:
-        payload = f"{job['clone_dir']}|{job['slug']}"
+        payload = f"{job['clone_dir']}|{job['slug']}|{job['domain']}"
         await query.edit_message_text("⭐ Ulduz ödənişinə keçilir...")
         await context.bot.send_invoice(
             chat_id=job["chat_id"],
@@ -653,8 +699,10 @@ async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     payment = update.message.successful_payment
     payload = payment.invoice_payload
-    clone_dir, _, slug = payload.partition("|")
-    slug = slug or "site"
+    parts = payload.split("|")
+    clone_dir = parts[0] if len(parts) > 0 else ""
+    slug = parts[1] if len(parts) > 1 else "site"
+    paid_domain = parts[2] if len(parts) > 2 else slug
 
     DATA["stats"]["total_stars"] = DATA["stats"].get("total_stars", 0) + payment.total_amount
     save_data()
@@ -664,9 +712,11 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
         return
 
     await update.message.reply_text("💳 Ödəniş təsdiqləndi! Arxiv hazırlanır...")
+
+    buyer = update.effective_user
     await log_event(
         context,
-        f"⭐ {user_label(update.effective_user)} — {payment.total_amount} ulduz ödədi (`{slug}`)",
+        f"💰 *{paid_domain}* saytı {user_label(buyer)} tərəfindən *{payment.total_amount} ⭐*-a klonlanıb alınıb.",
     )
     await send_clone_zip(context, update.effective_chat.id, clone_dir, slug)
 
@@ -743,6 +793,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "admin_stats":
         stats = DATA["stats"]
         active_credits = sum(DATA["credits"].values())
+        cache_sites, cache_size = scan_dir_stats(CACHE_BASE_DIR)
         text = (
             "📊 *Bot Statistikası*\n\n"
             f"👥 İstifadəçilər: *{len(DATA['users'])}*\n"
@@ -750,7 +801,8 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📦 Göndərilən ZIP-lər: *{stats.get('total_zips', 0)}*\n"
             f"⭐ Qazanılan ulduzlar: *{stats.get('total_stars', 0)}*\n"
             f"🔗 Referral qeydiyyatları: *{sum(DATA['referrals'].values())}*\n"
-            f"🎟 Aktiv haklar (cəmi): *{active_credits}*"
+            f"🎟 Aktiv haklar (cəmi): *{active_credits}*\n"
+            f"💾 Keşdəki fayllar: *{cache_sites}* fayl, *{human_size(cache_size)}*"
         )
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=admin_back_keyboard())
 
@@ -873,6 +925,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_cmd))
+    app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_domain))
     app.add_handler(CallbackQueryHandler(menu_callback, pattern="^menu_"))
     app.add_handler(CallbackQueryHandler(admin_callback, pattern="^admin_"))
@@ -886,4 +939,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
