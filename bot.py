@@ -31,8 +31,8 @@ from telegram.ext import (
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8873950422:AAETT2MQCuKLoj5uHSpCDISdqvFP9a2Yaek")
 STARS_PRICE = 100                 # Telegram Stars miqdarı
 CLONE_BASE_DIR = "clones"         # klonların saxlanacağı qovluq
-WGET_TIMEOUT_SEC = 600             # klonlama üçün maksimum vaxt (10 dəqiqə)
-WGET2_MAX_THREADS = 10              # wget2 tapılarsa, paralel yükləmə thread sayı
+WGET_TIMEOUT_SEC = int(os.environ.get("WGET_TIMEOUT_SEC", "1800"))  # klonlama üçün maksimum vaxt (default 30 dəqiqə)
+WGET2_MAX_THREADS = 8                # wget2 tapılarsa paralel thread sayı (HTTP/1.1 məcburi)
 ANIMATION_INTERVAL_SEC = 1.4
 
 SPECIAL_USER_ID = 8133937162
@@ -218,7 +218,15 @@ def _make_zip(source_dir: str, zip_path: str):
 
 
 def build_wget_cmd(clone_dir: str, url: str) -> list[str]:
-    """wget2 tapılarsa paralel (sürətli) rejimdə, tapılmasa adi wget ilə klon əmrini qurur."""
+    """Klon əmrini qurur.
+
+    wget2-nin paralel rekursiv rejimindəki bilinən bug ("Recursive downloads with HTTP/2
+    not uniformly divided" — gitlab.com/gnuwget/wget2/issues/397) məhz HTTP/2 ilə bağlıdır:
+    çoxlu thread eyni HTTP/2 bağlantısını bölüşəndə iş düzgün paylanmır. Həlli: wget2 tapılarsa
+    HTTP/2-ni SÖNDÜRÜB (--no-http2) məcburi HTTP/1.1 işlədirik — hər thread öz ayrıca
+    bağlantısını alır, bölünmə düzgün olur və nəticə HƏM sürətli, HƏM tam olur.
+    Wget2 tapılmasa, adi (tək-thread) `wget`-ə keçir.
+    """
     wget2_path = shutil.which("wget2")
     base = [
         "-r", "-np", "-k", "-E", "-p",
@@ -227,7 +235,13 @@ def build_wget_cmd(clone_dir: str, url: str) -> list[str]:
         "--tries=2",
     ]
     if wget2_path:
-        return [wget2_path, f"--max-threads={WGET2_MAX_THREADS}", *base, "-P", clone_dir, url]
+        return [
+            wget2_path,
+            f"--max-threads={WGET2_MAX_THREADS}",
+            "--no-http2",
+            *base,
+            "-P", clone_dir, url,
+        ]
     return ["wget", *base, "-P", clone_dir, url]
 
 
