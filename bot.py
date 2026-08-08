@@ -28,7 +28,7 @@ from telegram.ext import (
 )
 
 # ============ TƏNZİMLƏMƏLƏR ============
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8873950422:AAHGCI2J71_Tnc3tleUrUGkW24ZehpL0qMA")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8873950422:AAETT2MQCuKLoj5uHSpCDISdqvFP9a2Yaek")
 STARS_PRICE = 100                 # Telegram Stars miqdarı
 CLONE_BASE_DIR = "clones"         # klonların saxlanacağı qovluq
 WGET_TIMEOUT_SEC = 600             # klonlama üçün maksimum vaxt (10 dəqiqə)
