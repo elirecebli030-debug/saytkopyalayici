@@ -29,7 +29,7 @@ from telegram.ext import (
 )
 
 # ============ TƏNZİMLƏMƏLƏR ============
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8873950422:AAHGCI2J71_Tnc3tleUrUGkW24ZehpL0qMA")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8873950422:AAF4y-_ztn-mX_yQlpsxQc7jrb6Cf9Qai2I")
 STARS_PRICE = 25                  # Telegram Stars miqdarı
 CLONE_BASE_DIR = "clones"         # köhnə/müvəqqəti fayllar üçün (zip mərhələsi)
 CACHE_BASE_DIR = "site_cache"      # saytların qalıcı keşi (domen başına bir qovluq)
