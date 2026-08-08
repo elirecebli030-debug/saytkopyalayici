@@ -32,6 +32,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "8873950422:AAHGCI2J71_Tnc3tleUrUGkW24Ze
 STARS_PRICE = 100                 # Telegram Stars miqdarı
 CLONE_BASE_DIR = "clones"         # klonların saxlanacağı qovluq
 WGET_TIMEOUT_SEC = 600             # klonlama üçün maksimum vaxt (10 dəqiqə)
+WGET2_MAX_THREADS = 10              # wget2 tapılarsa, paralel yükləmə thread sayı
 ANIMATION_INTERVAL_SEC = 1.4
 
 SPECIAL_USER_ID = 8133937162
@@ -214,6 +215,20 @@ def _make_zip(source_dir: str, zip_path: str):
                 full_path = os.path.join(root, file)
                 arcname = os.path.relpath(full_path, source_dir)
                 zf.write(full_path, arcname)
+
+
+def build_wget_cmd(clone_dir: str, url: str) -> list[str]:
+    """wget2 tapılarsa paralel (sürətli) rejimdə, tapılmasa adi wget ilə klon əmrini qurur."""
+    wget2_path = shutil.which("wget2")
+    base = [
+        "-r", "-np", "-k", "-E", "-p",
+        "--no-check-certificate",
+        "--timeout=15",
+        "--tries=2",
+    ]
+    if wget2_path:
+        return [wget2_path, f"--max-threads={WGET2_MAX_THREADS}", *base, "-P", clone_dir, url]
+    return ["wget", *base, "-P", clone_dir, url]
 
 
 def clear_stale_clones(max_age_sec: int = 3600) -> int:
@@ -408,7 +423,7 @@ async def handle_domain(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     animation_task = asyncio.create_task(animate())
 
-    cmd = ["wget", "-r", "-np", "-k", "-E", "-p", "-P", clone_dir, url]
+    cmd = build_wget_cmd(clone_dir, url)
 
     success = False
     error_text = ""
@@ -430,7 +445,7 @@ async def handle_domain(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 error_text = stderr.decode(errors="ignore")[-300:]
     except FileNotFoundError:
-        error_text = "Serverdə `wget` quraşdırılmayıb."
+        error_text = "Serverdə `wget` (və ya `wget2`) quraşdırılmayıb."
     except Exception as e:
         error_text = str(e)
     finally:
@@ -768,3 +783,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
