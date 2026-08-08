@@ -5,9 +5,10 @@ import os
 import re
 import shutil
 import time
+import urllib.request
 import uuid
 import zipfile
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 from telegram import (
     Update,
@@ -28,10 +29,12 @@ from telegram.ext import (
 )
 
 # ============ TƏNZİMLƏMƏLƏR ============
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8873950422:AAEpEogl2XZmnrnaYJf2DGREK5sM7WLo9SE")
-STARS_PRICE = 100                 # Telegram Stars miqdarı
-CLONE_BASE_DIR = "clones"         # klonların saxlanacağı qovluq
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8873950422:AAHGCI2J71_Tnc3tleUrUGkW24ZehpL0qMA")
+STARS_PRICE = 25                  # Telegram Stars miqdarı
+CLONE_BASE_DIR = "clones"         # köhnə/müvəqqəti fayllar üçün (zip mərhələsi)
+CACHE_BASE_DIR = "site_cache"      # saytların qalıcı keşi (domen başına bir qovluq)
 WGET_TIMEOUT_SEC = int(os.environ.get("WGET_TIMEOUT_SEC", "1800"))  # klonlama üçün maksimum vaxt (default 30 dəqiqə)
+PARALLEL_WORKERS = int(os.environ.get("PARALLEL_WORKERS", "4"))  # eyni anda neçə wget prosesi işləsin
 ANIMATION_INTERVAL_SEC = 1.4
 
 SPECIAL_USER_ID = 8133937162
@@ -51,6 +54,24 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 os.makedirs(CLONE_BASE_DIR, exist_ok=True)
+os.makedirs(CACHE_BASE_DIR, exist_ok=True)
+
+# Eyni domenin paralel iki dəfə klonlanmasının qarşısını alan kilidlər
+_DOMAIN_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def get_domain_lock(domain: str) -> asyncio.Lock:
+    lock = _DOMAIN_LOCKS.get(domain)
+    if lock is None:
+        lock = asyncio.Lock()
+        _DOMAIN_LOCKS[domain] = lock
+    return lock
+
+
+def cache_dir_for(domain: str) -> str:
+    """Domenə uyğun qalıcı keş qovluğu (təkrar klonlamalarda saxlanılır)."""
+    safe = re.sub(r"[^a-zA-Z0-9.-]", "_", domain)
+    return os.path.join(CACHE_BASE_DIR, safe)
 
 # Ödəniş/hak seçimi gözləyən klonlar üçün müvəqqəti yaddaş (yaddaşda saxlanılır, restart-da sıfırlanır)
 PENDING_JOBS: dict[str, dict] = {}
@@ -216,22 +237,94 @@ def _make_zip(source_dir: str, zip_path: str):
                 zf.write(full_path, arcname)
 
 
-def build_wget_cmd(clone_dir: str, url: str) -> list[str]:
-    """Klon əmrini qurur.
+def discover_seed_links(url: str, max_seeds: int) -> list[str]:
+    """Ana səhifədən eyni-domenli linkləri çıxarır ki, paralel worker-lər üçün başlanğıc
+    nöqtələri olsun. Şəbəkə/parse xətası olarsa boş siyahı qaytarır (təhlükəsiz fallback)."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; SiteCloneBot/1.0)"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            html = resp.read(800_000).decode(errors="ignore")
+    except Exception:
+        return []
 
-    wget2 (paralel rejim) sınandı, hətta --no-http2 ilə də etibarsız çıxdı — real testdə
-    eyni saytı 102 fayl yerinə cəmi 2 fayla "bitdi" göstərdi (səssiz, yarımçıq nəticə).
-    Ona görə HƏMİŞƏ adi, sübut olunmuş `wget` istifadə olunur. Tamlıq sürətdən vacibdir;
-    Termux testində eyni yanaşma orta ölçülü sayt üçün 46 saniyəyə tam nəticə verdi —
-    bu, kifayət qədər sürətlidir.
+    base_netloc = urlparse(url).netloc
+    start_path = urlparse(url).path or "/"
+    seen_paths = set()
+    seeds = []
+    for h in re.findall(r'href=["\']([^"\'#]+)', html):
+        try:
+            absu = urljoin(url, h)
+            p = urlparse(absu)
+            if p.scheme not in ("http", "https") or p.netloc != base_netloc:
+                continue
+            key = p.path or "/"
+            if key in seen_paths or key == start_path:
+                continue
+            seen_paths.add(key)
+            seeds.append(absu)
+        except Exception:
+            continue
+        if len(seeds) >= max_seeds:
+            break
+    return seeds
+
+
+async def run_clone(clone_dir: str, url: str) -> tuple[bool, str]:
+    """Saytı klonlayır: mümkünsə bir neçə MÜSTƏQİL `wget` prosesi ilə paralel (hər biri
+    ana səhifədən tapılan fərqli bir başlanğıc linkdən özünəməxsus rekursiv gəzinti aparır),
+    mümkün olmasa tək prosesli fallback. Hər proses `-N` (timestamping) istifadə edir —
+    əvvəlki klonda saxlanılan fayllar dəyişməyibsə YENİDƏN yüklənmir, bu da təkrar
+    klonlamaları xeyli sürətləndirir (keş effekti). wget2 İSTİFADƏ OLUNMUR — real testlərdə
+    onun paralel rekursiv rejimi etibarsız (yarımçıq nəticə) çıxdı, bu yanaşma isə hər worker
+    üçün sübut olunmuş klassik `wget` mühərrikini işlədir.
     """
-    base = [
-        "-r", "-np", "-k", "-E", "-p",
+    seeds = await asyncio.to_thread(discover_seed_links, url, PARALLEL_WORKERS * 3)
+
+    base_flags = [
+        "-r", "-np", "-k", "-E", "-p", "-N",
         "--no-check-certificate",
         "--timeout=15",
         "--tries=2",
     ]
-    return ["wget", *base, "-P", clone_dir, url]
+
+    async def run_one(urls: list[str]) -> str:
+        cmd = ["wget", *base_flags, "-P", clone_dir, *urls]
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            _, stderr = await process.communicate()
+            if process.returncode in (0, 8):
+                return ""
+            return stderr.decode(errors="ignore")[-200:]
+        except FileNotFoundError:
+            return "Serverdə `wget` quraşdırılmayıb."
+        except Exception as e:
+            return str(e)
+
+    if len(seeds) >= 2:
+        n_groups = min(len(seeds), PARALLEL_WORKERS)
+        groups: list[list[str]] = [[] for _ in range(n_groups)]
+        groups[0].append(url)
+        for i, s in enumerate(seeds):
+            groups[i % n_groups].append(s)
+    else:
+        groups = [[url]]
+
+    try:
+        errors = await asyncio.wait_for(
+            asyncio.gather(*(run_one(g) for g in groups)), timeout=WGET_TIMEOUT_SEC
+        )
+    except asyncio.TimeoutError:
+        has_files = os.path.isdir(clone_dir) and any(os.scandir(clone_dir))
+        return has_files, "Vaxt limiti bitdi (sayt çox böyük ola bilər)."
+
+    has_files = os.path.isdir(clone_dir) and any(os.scandir(clone_dir))
+    if not has_files:
+        combined = "; ".join(e for e in errors if e) or "naməlum xəta"
+        return False, combined
+    return True, ""
+
 
 
 def clear_stale_clones(max_age_sec: int = 3600) -> int:
@@ -389,86 +482,77 @@ async def handle_domain(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     domain = urlparse(url).netloc
     slug = site_slug(domain)
-    job_id = uuid.uuid4().hex[:8]
-    clone_dir = os.path.join(CLONE_BASE_DIR, f"{domain}-{job_id}")
+    clone_dir = cache_dir_for(domain)
+    is_repeat = os.path.isdir(clone_dir) and any(os.scandir(clone_dir))
     os.makedirs(clone_dir, exist_ok=True)
 
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-    status_msg = await update.message.reply_text(f"🚀 *{domain}* klonlanmağa başlanır...", parse_mode="Markdown")
-    await log_event(context, f"🌐 {user_label(user)} klonlamağa başladı: `{domain}`")
-
-    stop_animation = asyncio.Event()
-    start_time = time.time()
-    spinner_frames = ["◐", "◓", "◑", "◒"]
-
-    async def animate():
-        i = 0
-        while not stop_animation.is_set():
-            elapsed = time.time() - start_time
-            remaining = WGET_TIMEOUT_SEC - elapsed
-            file_count, total_size = scan_dir_stats(clone_dir)
-            bar = make_progress_bar(elapsed, WGET_TIMEOUT_SEC)
-            spin = spinner_frames[i % len(spinner_frames)]
-            text = (
-                f"{spin} *{domain}* klonlanır...\n\n"
-                f"{bar}\n"
-                f"📄 Fayllar: *{file_count}*\n"
-                f"💾 Ölçü: *{human_size(total_size)}*\n"
-                f"⏱ Keçən vaxt: `{format_time(elapsed)}`\n"
-                f"⏳ Limitə qalan: `{format_time(remaining)}`"
-            )
-            try:
-                await status_msg.edit_text(text, parse_mode="Markdown")
-            except Exception:
-                pass
-            i += 1
-            await asyncio.sleep(ANIMATION_INTERVAL_SEC)
-
-    animation_task = asyncio.create_task(animate())
-
-    cmd = build_wget_cmd(clone_dir, url)
-
-    success = False
-    error_text = ""
-    try:
-        process = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    domain_lock = get_domain_lock(domain)
+    if domain_lock.locked():
+        await update.message.reply_text(
+            f"⏳ *{domain}* hazırda başqa sorğu tərəfindən yenilənir, sıra gözlənilir...",
+            parse_mode="Markdown",
         )
+
+    async with domain_lock:
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+        start_label = "yenilənir (keşdən)" if is_repeat else "klonlanmağa başlanır"
+        status_msg = await update.message.reply_text(f"🚀 *{domain}* {start_label}...", parse_mode="Markdown")
+        await log_event(context, f"🌐 {user_label(user)} klonlamağa başladı: `{domain}`" + (" (keş yeniləməsi)" if is_repeat else ""))
+
+        stop_animation = asyncio.Event()
+        start_time = time.time()
+        spinner_frames = ["◐", "◓", "◑", "◒"]
+
+        async def animate():
+            i = 0
+            while not stop_animation.is_set():
+                elapsed = time.time() - start_time
+                remaining = WGET_TIMEOUT_SEC - elapsed
+                file_count, total_size = scan_dir_stats(clone_dir)
+                bar = make_progress_bar(elapsed, WGET_TIMEOUT_SEC)
+                spin = spinner_frames[i % len(spinner_frames)]
+                text = (
+                    f"{spin} *{domain}* {'yenilənir' if is_repeat else 'klonlanır'}...\n\n"
+                    f"{bar}\n"
+                    f"📄 Fayllar: *{file_count}*\n"
+                    f"💾 Ölçü: *{human_size(total_size)}*\n"
+                    f"⏱ Keçən vaxt: `{format_time(elapsed)}`\n"
+                    f"⏳ Limitə qalan: `{format_time(remaining)}`"
+                )
+                try:
+                    await status_msg.edit_text(text, parse_mode="Markdown")
+                except Exception:
+                    pass
+                i += 1
+                await asyncio.sleep(ANIMATION_INTERVAL_SEC)
+
+        animation_task = asyncio.create_task(animate())
+
         try:
-            _, stderr = await asyncio.wait_for(process.communicate(), timeout=WGET_TIMEOUT_SEC)
-        except asyncio.TimeoutError:
-            process.kill()
-            error_text = "Vaxt limiti bitdi (sayt çox böyük ola bilər)."
-        else:
-            if process.returncode in (0, 8):
-                has_files = any(os.scandir(clone_dir))
-                success = has_files
-                if not has_files:
-                    error_text = "Saytdan heç bir fayl endirilmədi."
-            else:
-                error_text = stderr.decode(errors="ignore")[-300:]
-    except FileNotFoundError:
-        error_text = "Serverdə `wget` (və ya `wget2`) quraşdırılmayıb."
-    except Exception as e:
-        error_text = str(e)
-    finally:
-        stop_animation.set()
-        await animation_task
+            success, error_text = await run_clone(clone_dir, url)
+        finally:
+            stop_animation.set()
+            await animation_task
 
     if not success:
-        shutil.rmtree(clone_dir, ignore_errors=True)
+        # Qeyd: keş qovluğu silinmir — əgər əvvəllər uğurlu klon var idisə, o qalır
+        # (bu sorğu sadəcə yeniləmə cəhdi idi, uğursuz oldu deyə köhnə keşi itirmirik).
+        if not is_repeat:
+            shutil.rmtree(clone_dir, ignore_errors=True)
         await status_msg.edit_text(f"❌ *{domain}* kopyalanmadı.\nSəbəb: {error_text or 'naməlum xəta'}", parse_mode="Markdown")
         await log_event(context, f"❌ {user_label(user)} — `{domain}` klonlanmadı: {error_text or 'naməlum xəta'}")
         return
 
     total_elapsed = time.time() - start_time
     file_count, total_size = scan_dir_stats(clone_dir)
+    job_id = uuid.uuid4().hex[:8]
 
     DATA["stats"]["total_clones"] = DATA["stats"].get("total_clones", 0) + 1
     save_data()
 
+    status_word = "yeniləndi (keşdən)" if is_repeat else "uğurla klonlandı"
     summary = (
-        f"✅ *{domain}* uğurla klonlandı!\n\n"
+        f"✅ *{domain}* {status_word}!\n\n"
         f"📄 Fayllar: *{file_count}*\n"
         f"💾 Ölçü: *{human_size(total_size)}*\n"
         f"⏱ Çəkilən vaxt: `{format_time(total_elapsed)}`\n"
@@ -588,7 +672,9 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
 
 
 async def send_clone_zip(context: ContextTypes.DEFAULT_TYPE, chat_id: int, clone_dir: str, slug: str):
-    zip_path = clone_dir + ".zip"
+    """Keş qovluğunu zip edib göndərir. Keş qovluğunun özü SİLİNMİR (növbəti sorğuda
+    təkrar istifadə olunsun deyə) — yalnız müvəqqəti zip faylı təmizlənir."""
+    zip_path = os.path.join(CLONE_BASE_DIR, f"{uuid.uuid4().hex[:10]}.zip")
     display_name = f"{slug}-clone.zip"
 
     await asyncio.to_thread(_make_zip, clone_dir, zip_path)
@@ -605,7 +691,6 @@ async def send_clone_zip(context: ContextTypes.DEFAULT_TYPE, chat_id: int, clone
         DATA["stats"]["total_zips"] = DATA["stats"].get("total_zips", 0) + 1
         save_data()
     finally:
-        shutil.rmtree(clone_dir, ignore_errors=True)
         if os.path.exists(zip_path):
             os.remove(zip_path)
 
@@ -622,7 +707,8 @@ def admin_menu_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("🔗 Referral TOP", callback_data="admin_referrals")],
             [InlineKeyboardButton("🎟 Hak ver", callback_data="admin_grant_credit")],
             [InlineKeyboardButton("📢 Bildiriş göndər", callback_data="admin_broadcast")],
-            [InlineKeyboardButton("🗑 Keşi təmizlə", callback_data="admin_clear_cache")],
+            [InlineKeyboardButton("🗑 Müvəqqəti faylları təmizlə", callback_data="admin_clear_cache")],
+            [InlineKeyboardButton("🗑🌐 Sayt keşini tam təmizlə", callback_data="admin_clear_sitecache")],
             [InlineKeyboardButton("❌ Bağla", callback_data="admin_close")],
         ]
     )
@@ -707,6 +793,20 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "admin_clear_cache":
         removed = clear_stale_clones()
         await query.edit_message_text(f"🗑 Təmizləndi: *{removed}* köhnə qovluq/fayl silindi.", parse_mode="Markdown", reply_markup=admin_back_keyboard())
+
+    elif action == "admin_clear_sitecache":
+        count = 0
+        if os.path.isdir(CACHE_BASE_DIR):
+            for entry in os.scandir(CACHE_BASE_DIR):
+                try:
+                    shutil.rmtree(entry.path) if entry.is_dir() else os.remove(entry.path)
+                    count += 1
+                except OSError:
+                    pass
+        await query.edit_message_text(
+            f"🗑🌐 Sayt keşi tam təmizləndi: *{count}* sayt silindi. Növbəti klonlamalar sıfırdan gedəcək.",
+            parse_mode="Markdown", reply_markup=admin_back_keyboard(),
+        )
 
     elif action == "admin_back":
         await query.edit_message_text("🛠 *Admin Panel*", parse_mode="Markdown", reply_markup=admin_menu_keyboard())
