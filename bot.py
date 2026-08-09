@@ -29,7 +29,7 @@ from telegram.ext import (
 )
 
 # ============ TƏNZİMLƏMƏLƏR ============
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BO_TOKEN = os.environ.get("BOT_TOKEN", "")
 if not BOT_TOKEN:
     raise SystemExit(
         "XƏTA: BOT_TOKEN environment variable təyin olunmayıb. "
