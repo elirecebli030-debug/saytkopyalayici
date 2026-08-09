@@ -1,5 +1,4 @@
 import asyncio
-import json
 import logging
 import os
 import re
@@ -10,6 +9,7 @@ import uuid
 import zipfile
 from urllib.parse import urlparse, urljoin
 
+import asyncpg
 from telegram import (
     Update,
     LabeledPrice,
@@ -35,21 +35,33 @@ if not BOT_TOKEN:
         "XƏTA: BOT_TOKEN environment variable təyin olunmayıb. "
         "Railway/Termux-da BOT_TOKEN dəyişənini @BotFather-dan aldığınız token ilə əlavə edin."
     )
-STARS_PRICE = 25                  # Telegram Stars miqdarı
-CLONE_BASE_DIR = "clones"         # köhnə/müvəqqəti fayllar üçün (zip mərhələsi)
-CACHE_BASE_DIR = "site_cache"      # saytların qalıcı keşi (domen başına bir qovluq)
-WGET_TIMEOUT_SEC = int(os.environ.get("WGET_TIMEOUT_SEC", "1800"))  # klonlama üçün maksimum vaxt (default 30 dəqiqə)
-PARALLEL_WORKERS = int(os.environ.get("PARALLEL_WORKERS", "4"))  # eyni anda neçə wget prosesi işləsin
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+if not DATABASE_URL:
+    raise SystemExit(
+        "XƏTA: DATABASE_URL environment variable təyin olunmayıb. "
+        "Railway-də PostgreSQL əlavə edib onun Connection URL-ni DATABASE_URL kimi qoyun."
+    )
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+STARS_PRICE = 25                   # Telegram Stars miqdarı
+CLONE_BASE_DIR = "clones"          # müvəqqəti fayllar üçün (zip mərhələsi)
+CACHE_BASE_DIR = "site_cache"       # saytların qalıcı fayl keşi (domen başına bir qovluq)
+WGET_TIMEOUT_SEC = int(os.environ.get("WGET_TIMEOUT_SEC", "1800"))  # default 30 dəqiqə
+PARALLEL_WORKERS = int(os.environ.get("PARALLEL_WORKERS", "4"))
 ANIMATION_INTERVAL_SEC = 1.4
 
 SPECIAL_USER_ID = 8133937162
-ADMIN_IDS = {SPECIAL_USER_ID}       # /admin əmrinə və admin düyməsinə giriş
-FREE_USER_IDS = {SPECIAL_USER_ID}   # həmişə ödənişsiz, birbaşa zip
+ADMIN_IDS = {SPECIAL_USER_ID}
+FREE_USER_IDS = {SPECIAL_USER_ID}
 
-# Botu admin etdiyin loq kanalı — bütün fəaliyyət (kim, nə vaxt, hansı sayt, ödəniş/hak) bura yazılır
 LOG_CHANNEL_ID = os.environ.get("LOG_CHANNEL_ID", "-1003909741389")
 
-DATA_FILE = "data.json"
+# Məcburi kanal-üzvlük
+CHANNEL_INVITE_LINK = os.environ.get("CHANNEL_INVITE_LINK", "https://t.me/+ZLN6RXwRdj4zYWJi")
+# ⚠️ Rəqəmsal chat id (məs: -1001234567890) — boş qalarsa yoxlama AVTOMATİK BAĞLI olur
+CHANNEL_ID = os.environ.get("CHANNEL_ID", "").strip()
 # ========================================
 
 logging.basicConfig(
@@ -74,86 +86,173 @@ def get_domain_lock(domain: str) -> asyncio.Lock:
 
 
 def cache_dir_for(domain: str) -> str:
-    """Domenə uyğun qalıcı keş qovluğu (təkrar klonlamalarda saxlanılır)."""
     safe = re.sub(r"[^a-zA-Z0-9.-]", "_", domain)
     return os.path.join(CACHE_BASE_DIR, safe)
 
-# Ödəniş/hak seçimi gözləyən klonlar üçün müvəqqəti yaddaş (yaddaşda saxlanılır, restart-da sıfırlanır)
+
+# Ödəniş/hak seçimi gözləyən klonlar üçün müvəqqəti yaddaş (restart-da sıfırlanır — problem deyil, qısa ömürlüdür)
 PENDING_JOBS: dict[str, dict] = {}
 
-# Hər istifadəçinin hazırda işləyən klonlama task-ı (/cancel üçün)
+# Hər istifadəçinin hazırda işləyən klonlama task-ı (cancel düyməsi üçün)
 ACTIVE_CLONE_TASKS: dict[int, "asyncio.Task"] = {}
 
 
 # ---------------------------------------------------------------------------
-# Sadə JSON əsaslı yaddaş (istifadəçilər, referral, haklar, statistika)
+# PostgreSQL — qalıcı yaddaş (istifadəçilər, referral, haklar, statistika)
 # ---------------------------------------------------------------------------
 
-def _default_data():
-    return {
-        "users": [],
-        "referrals": {},   # referrer_id(str) -> count
-        "referred": {},    # referred_user_id(str) -> referrer_id(str)
-        "credits": {},     # user_id(str) -> qalan pulsuz klon sayı
-        "stats": {"total_clones": 0, "total_zips": 0, "total_stars": 0},
-    }
+POOL: asyncpg.Pool | None = None
 
 
-def load_data() -> dict:
-    defaults = _default_data()
-    if not os.path.exists(DATA_FILE):
-        return defaults
-    try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception as e:
-        logger.warning(f"data.json oxuna bilmədi, boş data ilə başlanır: {e}")
-        return defaults
-
-    if not isinstance(data, dict):
-        return defaults
-
-    # köhnə/pozulmuş data.json-dakı yanlış tipləri düzəldirik ki, bot çökməsin
-    if not isinstance(data.get("users"), list):
-        logger.warning("data.json: 'users' sahəsi list deyildi, sıfırlanır.")
-        data["users"] = defaults["users"]
-    if not isinstance(data.get("referrals"), dict):
-        data["referrals"] = defaults["referrals"]
-    if not isinstance(data.get("referred"), dict):
-        data["referred"] = defaults["referred"]
-    if not isinstance(data.get("credits"), dict):
-        data["credits"] = defaults["credits"]
-    if not isinstance(data.get("stats"), dict):
-        data["stats"] = defaults["stats"]
-    else:
-        for k, v in defaults["stats"].items():
-            data["stats"].setdefault(k, v)
-    return data
-
-
-DATA = load_data()
-save_data_needed = True
-
-
-def save_data():
-    try:
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(DATA, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.warning(f"data.json yazılmadı: {e}")
+async def db_init(app):
+    global POOL
+    POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+    async with POOL.acquire() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                joined_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            CREATE TABLE IF NOT EXISTS referrals (
+                referrer_id BIGINT PRIMARY KEY,
+                count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS referred (
+                user_id BIGINT PRIMARY KEY,
+                referrer_id BIGINT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS credits (
+                user_id BIGINT PRIMARY KEY,
+                amount INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS stats (
+                key TEXT PRIMARY KEY,
+                value BIGINT NOT NULL DEFAULT 0
+            );
+            """
+        )
+        for k in ("total_clones", "total_zips", "total_stars"):
+            await conn.execute(
+                "INSERT INTO stats(key, value) VALUES ($1, 0) ON CONFLICT (key) DO NOTHING", k
+            )
+    logger.info("PostgreSQL-ə qoşuldu və cədvəllər hazırlandı.")
 
 
-# fayl mövcud olmayıbsa və ya düzəldilibsə, dərhal diskə yazaq ki, "data.json faylı yoxdu" problemi olmasın
-save_data()
+async def db_close(app):
+    if POOL:
+        await POOL.close()
 
 
-def track_user(user_id: int) -> bool:
+async def db_track_user(user_id: int) -> bool:
     """Yeni istifadəçidirsə True qaytarır."""
-    if user_id not in DATA["users"]:
-        DATA["users"].append(user_id)
-        save_data()
-        return True
-    return False
+    async with POOL.acquire() as conn:
+        result = await conn.execute(
+            "INSERT INTO users(user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING", user_id
+        )
+        return result.endswith(" 1")
+
+
+async def db_user_count() -> int:
+    async with POOL.acquire() as conn:
+        return await conn.fetchval("SELECT COUNT(*) FROM users")
+
+
+async def db_all_user_ids() -> list[int]:
+    async with POOL.acquire() as conn:
+        rows = await conn.fetch("SELECT user_id FROM users")
+        return [r["user_id"] for r in rows]
+
+
+async def db_get_credits(user_id: int) -> int:
+    async with POOL.acquire() as conn:
+        val = await conn.fetchval("SELECT amount FROM credits WHERE user_id=$1", user_id)
+        return val or 0
+
+
+async def db_add_credits(user_id: int, amount: int) -> int:
+    async with POOL.acquire() as conn:
+        new_val = await conn.fetchval(
+            """
+            INSERT INTO credits(user_id, amount) VALUES ($1, GREATEST($2, 0))
+            ON CONFLICT (user_id) DO UPDATE SET amount = GREATEST(credits.amount + $2, 0)
+            RETURNING amount
+            """,
+            user_id, amount,
+        )
+        return new_val
+
+
+async def db_use_credit(user_id: int) -> int:
+    async with POOL.acquire() as conn:
+        new_val = await conn.fetchval(
+            "UPDATE credits SET amount = GREATEST(amount - 1, 0) WHERE user_id=$1 RETURNING amount",
+            user_id,
+        )
+        return new_val or 0
+
+
+async def db_total_credits() -> int:
+    async with POOL.acquire() as conn:
+        return await conn.fetchval("SELECT COALESCE(SUM(amount), 0) FROM credits")
+
+
+async def db_referral_count(referrer_id: int) -> int:
+    async with POOL.acquire() as conn:
+        val = await conn.fetchval("SELECT count FROM referrals WHERE referrer_id=$1", referrer_id)
+        return val or 0
+
+
+async def db_top_referrals(limit: int = 5) -> list[tuple[int, int]]:
+    async with POOL.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT referrer_id, count FROM referrals ORDER BY count DESC LIMIT $1", limit
+        )
+        return [(r["referrer_id"], r["count"]) for r in rows]
+
+
+async def db_total_referrals() -> int:
+    async with POOL.acquire() as conn:
+        return await conn.fetchval("SELECT COALESCE(SUM(count), 0) FROM referrals")
+
+
+async def db_register_referral(referred_user_id: int, referrer_id: int) -> bool:
+    """Hər istifadəçi YALNIZ BİR DƏFƏ referal ola bilər. Özünə-referral bloklanır.
+    Uğurlu qeydiyyatda True, əks halda (artıq referal olub / özünə cəhd) False qaytarır."""
+    if referred_user_id == referrer_id:
+        return False
+    async with POOL.acquire() as conn:
+        async with conn.transaction():
+            inserted = await conn.fetchrow(
+                "INSERT INTO referred(user_id, referrer_id) VALUES ($1,$2) "
+                "ON CONFLICT DO NOTHING RETURNING user_id",
+                referred_user_id, referrer_id,
+            )
+            if not inserted:
+                return False
+            await conn.execute(
+                """
+                INSERT INTO referrals(referrer_id, count) VALUES ($1, 1)
+                ON CONFLICT (referrer_id) DO UPDATE SET count = referrals.count + 1
+                """,
+                referrer_id,
+            )
+    return True
+
+
+async def db_incr_stat(key: str, amount: int = 1):
+    async with POOL.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO stats(key, value) VALUES ($1,$2) "
+            "ON CONFLICT (key) DO UPDATE SET value = stats.value + $2",
+            key, amount,
+        )
+
+
+async def db_get_stats() -> dict:
+    async with POOL.acquire() as conn:
+        rows = await conn.fetch("SELECT key, value FROM stats")
+        return {r["key"]: r["value"] for r in rows}
 
 
 def user_label(user) -> str:
@@ -163,13 +262,58 @@ def user_label(user) -> str:
 
 
 async def log_event(context: ContextTypes.DEFAULT_TYPE, text: str):
-    """Admin loq kanalına fəaliyyət mesajı göndərir (kanal ID düzgün deyilsə səssizcə keçir)."""
     if not LOG_CHANNEL_ID:
         return
     try:
         await context.bot.send_message(chat_id=LOG_CHANNEL_ID, text=text, parse_mode="Markdown")
     except Exception as e:
         logger.warning(f"Loq kanalına göndərilmədi: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Kanal-üzvlük yoxlaması (məcburi qoşulma)
+# ---------------------------------------------------------------------------
+
+_warned_no_channel = False
+
+
+async def is_subscribed(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    global _warned_no_channel
+    if not CHANNEL_ID:
+        if not _warned_no_channel:
+            logger.warning("CHANNEL_ID təyin olunmayıb — kanal yoxlaması AKTİV DEYİL.")
+            _warned_no_channel = True
+        return True
+    try:
+        member = await context.bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
+        return member.status in ("member", "administrator", "creator")
+    except Exception as e:
+        logger.warning(f"Kanal üzvlüyü yoxlanıla bilmədi: {e}")
+        return False
+
+
+def subscription_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📢 Kanala qoşul", url=CHANNEL_INVITE_LINK)],
+            [InlineKeyboardButton("✅ Qatıldım", callback_data="check_sub")],
+        ]
+    )
+
+
+GATE_TEXT = (
+    "🔒 *Botdan istifadə etmək üçün əvvəlcə kanalımıza qoşulmalısan.*\n\n"
+    "1️⃣ Aşağıdakı *Kanala qoşul* düyməsinə bas\n"
+    "2️⃣ Qoşulduqdan sonra *✅ Qatıldım* düyməsinə bas"
+)
+NOT_JOINED_TEXT = "❌ *Kanala girməmisən.*\nZəhmət olmasa qoşul və yenidən cəhd et 👇"
+
+
+async def show_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message:
+        await update.message.reply_text(GATE_TEXT, reply_markup=subscription_keyboard(), parse_mode="Markdown")
+    elif update.callback_query:
+        await update.callback_query.edit_message_text(GATE_TEXT, reply_markup=subscription_keyboard(), parse_mode="Markdown")
 
 
 # ---------------------------------------------------------------------------
@@ -278,14 +422,11 @@ def discover_seed_links(url: str, max_seeds: int) -> list[str]:
 
 
 async def run_clone(clone_dir: str, url: str) -> tuple[bool, str]:
-    """Saytı klonlayır: mümkünsə bir neçə MÜSTƏQİL `wget` prosesi ilə paralel (hər biri
-    ana səhifədən tapılan fərqli bir başlanğıc linkdən özünəməxsus rekursiv gəzinti aparır),
-    mümkün olmasa tək prosesli fallback. Hər proses `-N` (timestamping) istifadə edir —
-    əvvəlki klonda saxlanılan fayllar dəyişməyibsə YENİDƏN yüklənmir, bu da təkrar
-    klonlamaları xeyli sürətləndirir (keş effekti). wget2 İSTİFADƏ OLUNMUR — real testlərdə
-    onun paralel rekursiv rejimi etibarsız (yarımçıq nəticə) çıxdı, bu yanaşma isə hər worker
-    üçün sübut olunmuş klassik `wget` mühərrikini işlədir.
-    """
+    """Saytı klonlayır: bir neçə MÜSTƏQİL `wget` prosesi ilə paralel (hər biri ana
+    səhifədən tapılan fərqli bir başlanğıc linkdən özünəməxsus rekursiv gəzinti aparır).
+    Hər proses `-N` (timestamping) istifadə edir — əvvəlki klonda saxlanılan fayllar
+    dəyişməyibsə yenidən yüklənmir (keş effekti). wget2 istifadə olunmur (real testlərdə
+    etibarsız çıxdı) — hər worker sübut olunmuş klassik `wget` mühərrikini işlədir."""
     seeds = await asyncio.to_thread(discover_seed_links, url, PARALLEL_WORKERS * 3)
 
     base_flags = [
@@ -339,7 +480,6 @@ async def run_clone(clone_dir: str, url: str) -> tuple[bool, str]:
     return True, ""
 
 
-
 def clear_stale_clones(max_age_sec: int = 3600) -> int:
     removed = 0
     now = time.time()
@@ -378,6 +518,10 @@ def menu_back_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Geri", callback_data="menu_back")]])
 
 
+def cancel_clone_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Klonlamağı dayandır", callback_data="cancel_clone")]])
+
+
 WELCOME_TEXT = (
     "👋 *Sayt Kopyalayıcı Bot*a xoş gəldin!\n\n"
     "🌐 İstənilən saytın tam statik köçürməsini bir neçə saniyəyə əldə edin.\n\n"
@@ -390,51 +534,85 @@ WELCOME_TEXT = (
 
 
 # ---------------------------------------------------------------------------
-# /start
+# /start, referral, kanal yoxlaması
 # ---------------------------------------------------------------------------
+
+async def maybe_register_referral(context: ContextTypes.DEFAULT_TYPE, user):
+    referrer_id = context.user_data.pop("pending_referrer_id", None)
+    if referrer_id is None:
+        return
+    ok = await db_register_referral(user.id, referrer_id)
+    if ok:
+        count = await db_referral_count(referrer_id)
+        try:
+            await context.bot.send_message(
+                referrer_id,
+                f"🎉 Referral linkinlə yeni istifadəçi qoşuldu!\n👥 Ümumi referral: {count}",
+            )
+        except Exception:
+            pass
+    else:
+        # artıq başqasının referal-ı olub və ya özünə cəhd edib — sükutla keç
+        pass
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    is_new = track_user(user.id)
+    is_new = await db_track_user(user.id)
     context.user_data.pop("awaiting_broadcast", None)
     context.user_data.pop("awaiting_credit_grant", None)
 
     if is_new:
         await log_event(context, f"🆕 Yeni istifadəçi: {user_label(user)}")
 
-    # referral qeydiyyatı — birbaşa /start-da sayılır (kanal yoxlaması yoxdur)
     if context.args:
         arg = context.args[0]
         if arg.startswith("ref_"):
-            referrer_id = arg[4:]
-            if (
-                referrer_id.isdigit()
-                and referrer_id != str(user.id)
-                and str(user.id) not in DATA["referred"]
-            ):
-                DATA["referred"][str(user.id)] = referrer_id
-                DATA["referrals"][referrer_id] = DATA["referrals"].get(referrer_id, 0) + 1
-                save_data()
-                try:
-                    await context.bot.send_message(
-                        int(referrer_id),
-                        f"🎉 Referral linkinlə yeni istifadəçi qoşuldu!\n"
-                        f"👥 Ümumi referral: {DATA['referrals'][referrer_id]}",
-                    )
-                except Exception:
-                    pass
+            candidate = arg[4:]
+            if candidate.isdigit():
+                context.user_data["pending_referrer_id"] = int(candidate)
 
-    await update.message.reply_text(WELCOME_TEXT, parse_mode="Markdown", reply_markup=main_menu_keyboard(user.id))
+    if user.id not in ADMIN_IDS and not await is_subscribed(context, user.id):
+        await show_gate(update, context)
+        return
+
+    await maybe_register_referral(context, user)
+    await send_welcome(update, context)
 
 
-async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def send_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    if update.message:
+        await update.message.reply_text(WELCOME_TEXT, parse_mode="Markdown", reply_markup=main_menu_keyboard(user_id))
+    elif update.callback_query:
+        await update.callback_query.edit_message_text(WELCOME_TEXT, parse_mode="Markdown", reply_markup=main_menu_keyboard(user_id))
+
+
+async def check_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+
+    if await is_subscribed(context, user.id):
+        await query.answer("✅ Təsdiqləndi!")
+        await maybe_register_referral(context, user)
+        await send_welcome(update, context)
+    else:
+        await query.answer("❌ Kanala qoşulmamısan!", show_alert=True)
+        try:
+            await query.edit_message_text(NOT_JOINED_TEXT, reply_markup=subscription_keyboard(), parse_mode="Markdown")
+        except Exception:
+            pass
+
+
+async def cancel_clone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
     task = ACTIVE_CLONE_TASKS.get(user_id)
     if task and not task.done():
         task.cancel()
-        await update.message.reply_text("🛑 Klonlama dayandırılır...")
+        await query.answer("Dayandırılır...")
     else:
-        await update.message.reply_text("ℹ️ Hazırda aktiv klonlama tapılmadı.")
+        await query.answer("Aktiv klonlama tapılmadı.", show_alert=True)
 
 
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -457,8 +635,8 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=menu_back_keyboard())
 
     elif action == "menu_mystats":
-        ref_count = DATA["referrals"].get(str(user_id), 0)
-        credits = DATA["credits"].get(str(user_id), 0)
+        ref_count = await db_referral_count(user_id)
+        credits = await db_get_credits(user_id)
         text = (
             "📊 *Sənin statistikan:*\n\n"
             f"🔗 Referral etdiyin istifadəçi: *{ref_count}*\n"
@@ -492,7 +670,11 @@ async def handle_domain(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await do_grant_credit(update, context)
         return
 
-    track_user(user_id)
+    if user_id not in ADMIN_IDS and not await is_subscribed(context, user_id):
+        await show_gate(update, context)
+        return
+
+    await db_track_user(user_id)
     raw_text = update.message.text
     url = normalize_domain(raw_text)
 
@@ -519,7 +701,9 @@ async def handle_domain(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with domain_lock:
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
         start_label = "yenilənir (keşdən)" if is_repeat else "klonlanmağa başlanır"
-        status_msg = await update.message.reply_text(f"🚀 *{domain}* {start_label}...", parse_mode="Markdown")
+        status_msg = await update.message.reply_text(
+            f"🚀 *{domain}* {start_label}...", parse_mode="Markdown", reply_markup=cancel_clone_keyboard()
+        )
         await log_event(context, f"🌐 {user_label(user)} klonlamağa başladı: `{domain}`" + (" (keş yeniləməsi)" if is_repeat else ""))
 
         stop_animation = asyncio.Event()
@@ -574,6 +758,7 @@ async def handle_domain(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🛑 *{domain}* klonlanması dayandırıldı.\n\n"
                 "Yenidən göndərmək istəyirsinizsə saytın ünvanını göndərin.",
                 parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([]),
             )
         except Exception:
             pass
@@ -581,11 +766,13 @@ async def handle_domain(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not success:
-        # Qeyd: keş qovluğu silinmir — əgər əvvəllər uğurlu klon var idisə, o qalır
-        # (bu sorğu sadəcə yeniləmə cəhdi idi, uğursuz oldu deyə köhnə keşi itirmirik).
         if not is_repeat:
             shutil.rmtree(clone_dir, ignore_errors=True)
-        await status_msg.edit_text(f"❌ *{domain}* kopyalanmadı.\nSəbəb: {error_text or 'naməlum xəta'}", parse_mode="Markdown")
+        await status_msg.edit_text(
+            f"❌ *{domain}* kopyalanmadı.\nSəbəb: {error_text or 'naməlum xəta'}",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([]),
+        )
         await log_event(context, f"❌ {user_label(user)} — `{domain}` klonlanmadı: {error_text or 'naməlum xəta'}")
         return
 
@@ -593,8 +780,7 @@ async def handle_domain(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_count, total_size = scan_dir_stats(clone_dir)
     job_id = uuid.uuid4().hex[:8]
 
-    DATA["stats"]["total_clones"] = DATA["stats"].get("total_clones", 0) + 1
-    save_data()
+    await db_incr_stat("total_clones", 1)
 
     status_word = "yeniləndi (keşdən)" if is_repeat else "uğurla klonlandı"
     summary = (
@@ -611,11 +797,11 @@ async def handle_domain(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 1) Admin / həmişəlik pulsuz istifadəçi
     if user_id in FREE_USER_IDS:
-        await status_msg.edit_text(summary + "\n📦 Arxiv hazırlanır...", parse_mode="Markdown")
+        await status_msg.edit_text(summary + "\n📦 Arxiv hazırlanır...", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([]))
         await send_clone_zip(context, update.effective_chat.id, clone_dir, slug)
         return
 
-    credits = DATA["credits"].get(str(user_id), 0)
+    credits = await db_get_credits(user_id)
 
     # 2) İstifadəçinin pulsuz hakkı varsa — seçim təklif olunur
     if credits > 0:
@@ -636,7 +822,11 @@ async def handle_domain(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # 3) Standart axın — ulduz ödənişi
-    await status_msg.edit_text(summary + f"\nFaylları yükləmək üçün {STARS_PRICE} ⭐ ödəniş et 👇", parse_mode="Markdown")
+    await status_msg.edit_text(
+        summary + f"\nFaylları yükləmək üçün {STARS_PRICE} ⭐ ödəniş et 👇",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([]),
+    )
 
     payload = f"{clone_dir}|{slug}|{domain}"
     await context.bot.send_invoice(
@@ -666,16 +856,14 @@ async def credit_choice_callback(update: Update, context: ContextTypes.DEFAULT_T
     PENDING_JOBS.pop(job_id, None)
 
     if action == "credit_use":
-        uid_str = str(job["user_id"])
-        DATA["credits"][uid_str] = max(0, DATA["credits"].get(uid_str, 0) - 1)
-        save_data()
+        new_balance = await db_use_credit(job["user_id"])
         await query.edit_message_text(
-            f"🎟 Hakdan istifadə olundu! Qalan hak: *{DATA['credits'][uid_str]}*\n\n📦 Arxiv hazırlanır...",
+            f"🎟 Hakdan istifadə olundu! Qalan hak: *{new_balance}*\n\n📦 Arxiv hazırlanır...",
             parse_mode="Markdown",
         )
         await log_event(
             context,
-            f"🎟 {user_label(query.from_user)} — `{job['domain']}` üçün hakdan istifadə etdi (qalan: {DATA['credits'][uid_str]})",
+            f"🎟 {user_label(query.from_user)} — `{job['domain']}` üçün hakdan istifadə etdi (qalan: {new_balance})",
         )
         await send_clone_zip(context, job["chat_id"], job["clone_dir"], job["slug"])
     else:
@@ -704,8 +892,7 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
     slug = parts[1] if len(parts) > 1 else "site"
     paid_domain = parts[2] if len(parts) > 2 else slug
 
-    DATA["stats"]["total_stars"] = DATA["stats"].get("total_stars", 0) + payment.total_amount
-    save_data()
+    await db_incr_stat("total_stars", payment.total_amount)
 
     if not os.path.isdir(clone_dir):
         await update.message.reply_text("⚠️ Ödəniş qəbul olundu, amma fayllar tapılmadı. Zəhmət olmasa dəstəklə əlaqə saxla.")
@@ -738,8 +925,7 @@ async def send_clone_zip(context: ContextTypes.DEFAULT_TYPE, chat_id: int, clone
                 caption=f"✅ Buyur! *{display_name}* hazırdır.",
                 parse_mode="Markdown",
             )
-        DATA["stats"]["total_zips"] = DATA["stats"].get("total_zips", 0) + 1
-        save_data()
+        await db_incr_stat("total_zips", 1)
     finally:
         if os.path.exists(zip_path):
             os.remove(zip_path)
@@ -791,27 +977,30 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     if action == "admin_stats":
-        stats = DATA["stats"]
-        active_credits = sum(DATA["credits"].values())
+        stats = await db_get_stats()
+        active_credits = await db_total_credits()
+        total_users = await db_user_count()
+        total_refs = await db_total_referrals()
         cache_sites, cache_size = scan_dir_stats(CACHE_BASE_DIR)
         text = (
             "📊 *Bot Statistikası*\n\n"
-            f"👥 İstifadəçilər: *{len(DATA['users'])}*\n"
+            f"👥 İstifadəçilər: *{total_users}*\n"
             f"🌐 Klonlanan saytlar: *{stats.get('total_clones', 0)}*\n"
             f"📦 Göndərilən ZIP-lər: *{stats.get('total_zips', 0)}*\n"
             f"⭐ Qazanılan ulduzlar: *{stats.get('total_stars', 0)}*\n"
-            f"🔗 Referral qeydiyyatları: *{sum(DATA['referrals'].values())}*\n"
+            f"🔗 Referral qeydiyyatları: *{total_refs}*\n"
             f"🎟 Aktiv haklar (cəmi): *{active_credits}*\n"
             f"💾 Keşdəki fayllar: *{cache_sites}* fayl, *{human_size(cache_size)}*"
         )
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=admin_back_keyboard())
 
     elif action == "admin_users":
-        text = f"👥 *Ümumi istifadəçi sayı:* {len(DATA['users'])}"
+        total_users = await db_user_count()
+        text = f"👥 *Ümumi istifadəçi sayı:* {total_users}"
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=admin_back_keyboard())
 
     elif action == "admin_referrals":
-        top = sorted(DATA["referrals"].items(), key=lambda x: x[1], reverse=True)[:5]
+        top = await db_top_referrals(5)
         if not top:
             text = "🔗 Hələ referral qeydiyyatı yoxdur."
         else:
@@ -873,7 +1062,7 @@ async def do_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = await update.message.reply_text("📢 Göndərilir...")
 
     sent, failed = 0, 0
-    for uid in DATA["users"]:
+    for uid in await db_all_user_ids():
         try:
             await context.bot.send_message(uid, text)
             sent += 1
@@ -894,25 +1083,24 @@ async def do_grant_credit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Format səhvdir. Nümunə: `123456789 3`", parse_mode="Markdown")
         return
 
-    target_id, amount = parts[0], int(parts[1])
-    DATA["credits"][target_id] = max(0, DATA["credits"].get(target_id, 0) + amount)
-    save_data()
+    target_id, amount = int(parts[0]), int(parts[1])
+    new_balance = await db_add_credits(target_id, amount)
 
     await update.message.reply_text(
-        f"✅ İstifadəçi `{target_id}` üçün hak yeniləndi. Yeni balans: *{DATA['credits'][target_id]}*",
+        f"✅ İstifadəçi `{target_id}` üçün hak yeniləndi. Yeni balans: *{new_balance}*",
         parse_mode="Markdown",
     )
     try:
         await context.bot.send_message(
-            int(target_id),
-            f"🎁 Sənə {amount} pulsuz sayt klonlama haqqı verildi!\n🎟 Cəmi hakların: {DATA['credits'][target_id]}",
+            target_id,
+            f"🎁 Sənə {amount} pulsuz sayt klonlama haqqı verildi!\n🎟 Cəmi hakların: {new_balance}",
         )
     except Exception:
         pass
 
     await log_event(
         context,
-        f"🎁 {user_label(update.effective_user)} — `{target_id}` istifadəçisinə {amount} hak verdi (yeni balans: {DATA['credits'][target_id]})",
+        f"🎁 {user_label(update.effective_user)} — `{target_id}` istifadəçisinə {amount} hak verdi (yeni balans: {new_balance})",
     )
 
 
@@ -921,12 +1109,20 @@ async def do_grant_credit(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(True)  # eyni anda bir neçə istifadəçiyə xidmət et (biri klonlayanda başqası bloklanmasın)
+        .post_init(db_init)
+        .post_shutdown(db_close)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_cmd))
-    app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_domain))
+    app.add_handler(CallbackQueryHandler(check_sub_callback, pattern="^check_sub$"))
+    app.add_handler(CallbackQueryHandler(cancel_clone_callback, pattern="^cancel_clone$"))
     app.add_handler(CallbackQueryHandler(menu_callback, pattern="^menu_"))
     app.add_handler(CallbackQueryHandler(admin_callback, pattern="^admin_"))
     app.add_handler(CallbackQueryHandler(credit_choice_callback, pattern="^credit_(use|pay):"))
@@ -939,3 +1135,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
